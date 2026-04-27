@@ -2,8 +2,6 @@
 
 **AWS Config auto-remediation abuse & detection**
 
-*Your compliance system is now the attacker.*
-
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)
 ![AWS](https://img.shields.io/badge/AWS-Config%20%7C%20Lambda%20%7C%20SSM-orange?style=flat-square&logo=amazon-aws)
 ![Category](https://img.shields.io/badge/Category-Post--Exploitation%20Persistence-red?style=flat-square)
@@ -12,6 +10,8 @@
 </div>
 
 ---
+
+⚠️ For authorized security research only. Run in sandbox accounts you own. Never use against infrastructure without explicit written permission.
 
 ## The Attack
 
@@ -320,11 +320,3 @@ The command fails fast if the target is unsuitable:
 ```
 
 > The `recent_mutation` heuristic relies on CloudTrail records for `UpdateFunctionCode`, `UpdateDocument`, and `UpdateDocumentDefaultVersion`. These are management events logged by default, no extra permission beyond `cloudtrail:LookupEvents` is required.
-
----
-
-<div align="center">
-
-*For educational and authorized security research purposes only.*
-
-</div>

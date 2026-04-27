@@ -39,12 +39,25 @@ from .remediation import DOCS
 BACKUP_ROOT = os.path.expanduser("~/.mirage/backups")
 
 
-def _snapshot_path(account_id: str, region: str, rule_name: str) -> str:
+def _snapshot_dir(account_id: str, region: str, rule_name: str) -> str:
     safe_rule = rule_name.replace("/", "_")
+    return os.path.join(BACKUP_ROOT, f"{account_id}-{region}-{safe_rule}")
+
+
+def _snapshot_path(account_id: str, region: str, rule_name: str) -> str:
+    d = _snapshot_dir(account_id, region, rule_name)
     ts = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    d = os.path.join(BACKUP_ROOT, f"{account_id}-{region}-{safe_rule}")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, f"{ts}.json")
+
+
+def _existing_snapshots(account_id: str, region: str, rule_name: str) -> list:
+    d = _snapshot_dir(account_id, region, rule_name)
+    if not os.path.isdir(d):
+        return []
+    return sorted([
+        os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")
+    ])
 
 
 def _download_lambda_zip(lam, function_name: str) -> bytes:
@@ -140,55 +153,63 @@ def hijack(
     _preflight(rule, remediation, rule_name, skip_ssm=skip_ssm)
 
     lambda_arn = rule["Source"]["SourceIdentifier"]
-    fn_name = _lambda_function_name_from_arn(lambda_arn)
+    fn_name = lambda_function_name_from_arn(lambda_arn)
     ssm_doc_name = remediation.get("TargetId") if remediation else None
 
     log(f"Lambda function:  {fn_name}")
     log(f"Lambda ARN:       {lambda_arn}")
     log(f"SSM document:     {ssm_doc_name}")
 
-    # 1. Snapshot originals (reversibility)
-    log("Snapshotting original Lambda zip + SSM doc content...")
-    original_zip = _download_lambda_zip(lam, fn_name)
-    original_doc_content = ""
-    original_doc_format = "YAML"
-    original_doc_version = ""
-    if ssm_doc_name:
-        try:
-            doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="YAML")
-            original_doc_content = doc_resp.get("Content", "")
-            original_doc_format = doc_resp.get("DocumentFormat", "YAML")
-            original_doc_version = doc_resp.get("DocumentVersion", "")
-        except ClientError as e:
-            # Try JSON format as a fallback for docs originally authored in JSON
-            if e.response["Error"]["Code"] in ("InvalidDocument", "InvalidDocumentContent"):
-                doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="JSON")
+    # 1. Check if a snapshot already exists (don't overwrite clean backups)
+    existing = _existing_snapshots(account_id, region, rule_name)
+    if existing:
+        latest = existing[-1]
+        print(f"[mirage hijack] Snapshot already exists (not overwriting): {latest}")
+        print(f"[mirage hijack] To restore later: mirage restore --rule {rule_name}")
+        snap_path = latest
+    else:
+        # 1b. Snapshot originals (reversibility)
+        log("Snapshotting original Lambda zip + SSM doc content...")
+        original_zip = _download_lambda_zip(lam, fn_name)
+        original_doc_content = ""
+        original_doc_format = "YAML"
+        original_doc_version = ""
+        if ssm_doc_name:
+            try:
+                doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="YAML")
                 original_doc_content = doc_resp.get("Content", "")
-                original_doc_format = doc_resp.get("DocumentFormat", "JSON")
+                original_doc_format = doc_resp.get("DocumentFormat", "YAML")
                 original_doc_version = doc_resp.get("DocumentVersion", "")
-            else:
-                raise
+            except ClientError as e:
+                # Try JSON format as a fallback for docs originally authored in JSON
+                if e.response["Error"]["Code"] in ("InvalidDocument", "InvalidDocumentContent"):
+                    doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="JSON")
+                    original_doc_content = doc_resp.get("Content", "")
+                    original_doc_format = doc_resp.get("DocumentFormat", "JSON")
+                    original_doc_version = doc_resp.get("DocumentVersion", "")
+                else:
+                    raise
 
-    snapshot = {
-        "account_id": account_id,
-        "region": region,
-        "rule_name": rule_name,
-        "target_template": target,
-        "lambda_function_name": fn_name,
-        "lambda_arn": lambda_arn,
-        "ssm_doc_name": ssm_doc_name,
-        "taken_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
-        "original_lambda_zip_b64": base64.b64encode(original_zip).decode("ascii"),
-        "original_ssm_doc_content": original_doc_content,
-        "original_ssm_doc_format": original_doc_format,
-        "original_ssm_doc_version": original_doc_version,
-        "skip_lambda": skip_lambda,
-        "skip_ssm": skip_ssm,
-    }
-    snap_path = _snapshot_path(account_id, region, rule_name)
-    with open(snap_path, "w") as f:
-        json.dump(snapshot, f, indent=2)
-    print(f"[mirage hijack] Snapshot: {snap_path}")
+        snapshot = {
+            "account_id": account_id,
+            "region": region,
+            "rule_name": rule_name,
+            "target_template": target,
+            "lambda_function_name": fn_name,
+            "lambda_arn": lambda_arn,
+            "ssm_doc_name": ssm_doc_name,
+            "taken_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
+            "original_lambda_zip_b64": base64.b64encode(original_zip).decode("ascii"),
+            "original_ssm_doc_content": original_doc_content,
+            "original_ssm_doc_format": original_doc_format,
+            "original_ssm_doc_version": original_doc_version,
+            "skip_lambda": skip_lambda,
+            "skip_ssm": skip_ssm,
+        }
+        snap_path = _snapshot_path(account_id, region, rule_name)
+        with open(snap_path, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        print(f"[mirage hijack] Snapshot: {snap_path}")
 
     emitted = []
 
@@ -220,7 +241,7 @@ def hijack(
             code = e.response["Error"]["Code"]
             if code == "DuplicateDocumentContent":
                 print("[mirage hijack] SSM doc already matches weakening content; "
-                      "skipping UpdateDocument.")
+                      "UpdateDocument skipped (no event emitted).")
             else:
                 raise
 
@@ -235,9 +256,12 @@ def hijack(
     else:
         print(f"[mirage hijack] SSM skipped (--skip-ssm)")
 
-    print("\n[mirage hijack] Events emitted:")
-    for e in emitted:
-        print(f"  - {e}")
+    print("\n[mirage hijack] Events emitted in this run:")
+    if emitted:
+        for e in emitted:
+            print(f"  - {e}")
+    else:
+        print("  (none - all operations were skipped or already applied)")
     print("[mirage hijack] NOT emitted: config:PutConfigRule, "
           "config:PutRemediationConfigurations,")
     print("                             lambda:CreateFunction, ssm:CreateDocument,")

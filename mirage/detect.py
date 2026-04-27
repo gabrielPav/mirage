@@ -11,13 +11,17 @@ def detect(region: str, verbose: bool = False, output_json: bool = False):
     """
     Scan all Config rules in the account and output a risk assessment.
     """
-    print(f"[mirage detect] Scanning Config rules in {region}...")
-    print("[mirage detect] Note: Temporal heuristics require cloudtrail:LookupEvents permission.\n")
+    if not output_json:
+        print(f"[mirage detect] Scanning Config rules in {region}...")
+        print("[mirage detect] Note: Temporal heuristics require cloudtrail:LookupEvents permission.\n")
 
     findings = analyze(region, verbose=verbose)
 
     if not findings:
-        print("[mirage detect] No Config rules found.")
+        if not output_json:
+            print("[mirage detect] No Config rules found.")
+        else:
+            print("[]")
         return
 
     if output_json:

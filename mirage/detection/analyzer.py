@@ -188,7 +188,7 @@ def analyze(region: str, verbose: bool = False) -> list:
         # Run all heuristics
         rule_findings = [
             check_unusual_principal(rule, cloudtrail_events),
-            check_undo_delta(rule, cloudtrail_events),
+            check_undo_delta(rule, cloudtrail_events, region=region),
             check_inverted_logic(rule, lambda_code),
             check_remediation_weakens(rule, ssm_doc_content, lambda_code),
             check_naming_anomaly(rule),

@@ -121,7 +121,7 @@ def _is_human_actor(event: dict) -> bool:
     return True
 
 
-def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
+def check_undo_delta(rule: dict, cloudtrail_events: list, region: str = None) -> tuple:
     """
     Heuristic: The 'undo delta' — the strongest signal.
     Detects: human hardens resource → SSM weakens the SAME resource within 5 minutes.
@@ -129,6 +129,8 @@ def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
     Only fires if (a) the rule has auto-remediation attached and (b) we can
     correlate a hardening and a weakening event on the same resource ID.
     Requires CloudTrail LookupEvents access. Returns 0 if no events.
+    
+    Falls back to SSM API if CloudTrail parameters are redacted.
     """
     if not rule.get("_has_remediation"):
         return (0, "")
@@ -181,6 +183,70 @@ def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
                     f"followed by SSM weakening on resource [{shared}] at {s_time} "
                     f"({int(delta)}s apart)",
                 )
+
+    # Fallback: CloudTrail parameters may be redacted. Query SSM API directly.
+    if region and human_hardening and ssm_weakening:
+        try:
+            ssm = boto3.client("ssm", region_name=region)
+            rem_doc = rule.get("_remediation_target", "")
+            if not rem_doc:
+                return (0, "")
+            
+            # Get recent SSM executions for this remediation doc
+            resp = ssm.describe_automation_executions(
+                Filters=[
+                    {"Key": "DocumentNamePrefix", "Values": [rem_doc]},
+                    {"Key": "ExecutionStatus", "Values": ["Success", "InProgress"]},
+                ],
+                MaxResults=10,
+            )
+            
+            for h_event in human_hardening:
+                h_time = h_event.get("EventTime")
+                if not h_time:
+                    continue
+                if isinstance(h_time, str):
+                    h_time = datetime.fromisoformat(h_time.replace("Z", "+00:00"))
+                h_ids = _extract_resource_ids(h_event)
+                if not h_ids:
+                    continue
+                
+                for exec_meta in resp.get("AutomationExecutionMetadataList", []):
+                    exec_id = exec_meta.get("AutomationExecutionId")
+                    exec_time = exec_meta.get("ExecutionStartTime")
+                    if not exec_time:
+                        continue
+                    if isinstance(exec_time, str):
+                        exec_time = datetime.fromisoformat(exec_time.replace("Z", "+00:00"))
+                    
+                    delta = abs((exec_time - h_time).total_seconds())
+                    if delta > WINDOW_SECONDS:
+                        continue
+                    
+                    # Get execution details to extract ResourceId
+                    try:
+                        exec_detail = ssm.get_automation_execution(
+                            AutomationExecutionId=exec_id
+                        )
+                        params = exec_detail.get("AutomationExecution", {}).get("Parameters", {})
+                        resource_ids = params.get("ResourceId", [])
+                        if isinstance(resource_ids, list):
+                            resource_ids = set(resource_ids)
+                        else:
+                            resource_ids = {resource_ids}
+                        
+                        if h_ids & resource_ids:
+                            shared = ", ".join(sorted(h_ids & resource_ids))
+                            return (
+                                40,
+                                f"UNDO DELTA: Human hardening '{h_event['EventName']}' at {h_time} "
+                                f"followed by SSM weakening on resource [{shared}] at {exec_time} "
+                                f"({int(delta)}s apart)",
+                            )
+                    except ClientError:
+                        pass
+        except ClientError:
+            pass
 
     return (0, "")
 
