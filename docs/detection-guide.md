@@ -1,4 +1,4 @@
-# Detection Guide — Identifying Malicious Config Remediation
+# Detection Guide - Identifying Malicious Config Remediation
 
 This guide documents how to detect the Mirage attack pattern in a real AWS environment.
 
@@ -6,20 +6,21 @@ This guide documents how to detect the Mirage attack pattern in a real AWS envir
 
 ## What You're Looking For
 
-An attacker has deployed Config rules with inverted logic — rules that flag *secure* configurations as non-compliant and trigger remediation that *undoes* hardening. The attacker's credentials are gone. The loop runs under AWS service roles.
+An attacker has deployed Config rules with inverted logic: rules that flag *secure* configurations as non-compliant and trigger remediation that *undoes* hardening. The attacker's credentials are gone. The loop runs under AWS service roles.
 
 ---
 
 ## Detection Signal 1: The Undo Delta (Highest Confidence)
 
-**What it is:** A human hardens a resource, and SSM Automation weakens the same resource within minutes.
+**What it is:** An engineer hardens a resource, and SSM Automation weakens the same resource within minutes.
 
 **How to find it in CloudTrail:**
 
 Query for hardening events followed by SSM weakening events on the same resource within a 5-minute window:
 
 ```
-Hardening events:
+Hardening events (note: PutBucketPolicy and PutKeyPolicy are ambiguous - the same API can apply a restrictive OR a permissive policy, so the policy body must be inspected. CreateNetworkAclEntry is hardening only when ruleAction=deny):
+
   PutBucketPolicy, PutBucketPublicAccessBlock
   RevokeSecurityGroupIngress
   CreateNetworkAclEntry
@@ -27,6 +28,7 @@ Hardening events:
   DetachRolePolicy, DeleteRolePolicy
 
 Weakening events (same resource, within 5 min):
+
   StartAutomationExecution (source: ssm.amazonaws.com)
   DeleteBucketPolicy
   AuthorizeSecurityGroupIngress
@@ -36,6 +38,10 @@ Weakening events (same resource, within 5 min):
 **Athena query (if CloudTrail logs are in S3):**
 
 ```sql
+-- Joins on a shared resource identifier extracted from each event's
+-- requestParameters. The SSM execution's parameters.ResourceId field carries
+-- the target resource (bucket name, SG id, etc.); the hardening event carries
+-- it under bucketName / groupId / networkAclId / keyId / roleName.
 SELECT
   h.eventtime AS harden_time,
   h.eventname AS harden_action,
@@ -46,8 +52,21 @@ SELECT
       to_unixtime(cast(h.eventtime AS timestamp))) AS delta_seconds
 FROM cloudtrail_logs h
 JOIN cloudtrail_logs s
-  ON h.requestparameters LIKE CONCAT('%', s.requestparameters, '%')
-WHERE h.eventname IN ('PutBucketPolicy','RevokeSecurityGroupIngress','PutKeyPolicy')
+  ON COALESCE(
+       json_extract_scalar(h.requestparameters, '$.bucketName'),
+       json_extract_scalar(h.requestparameters, '$.groupId'),
+       json_extract_scalar(h.requestparameters, '$.networkAclId'),
+       json_extract_scalar(h.requestparameters, '$.keyId'),
+       json_extract_scalar(h.requestparameters, '$.roleName')
+     ) = element_at(
+       cast(json_extract(s.requestparameters, '$.parameters.ResourceId') AS array<varchar>),
+       1
+     )
+WHERE h.eventname IN (
+        'PutBucketPolicy','PutBucketPublicAccessBlock',
+        'RevokeSecurityGroupIngress','CreateNetworkAclEntry',
+        'PutKeyPolicy','DetachRolePolicy','DeleteRolePolicy'
+      )
   AND s.eventsource = 'ssm.amazonaws.com'
   AND s.eventname = 'StartAutomationExecution'
   AND ABS(to_unixtime(cast(s.eventtime AS timestamp)) -
@@ -59,7 +78,7 @@ ORDER BY delta_seconds ASC;
 
 ## Detection Signal 2: Audit Your Config Rules
 
-**Most teams never do this.** Run this check monthly:
+This is rarely done in real environments. Run this check monthly:
 
 ```bash
 # List all custom Lambda-backed Config rules
@@ -122,16 +141,19 @@ aws ssm get-document --name AWS-S3BucketPolicyRemediation --document-format YAML
 **Red flags in SSM document content:**
 - `delete_bucket_policy` / `DeleteBucketPolicy`
 - `authorize_security_group_ingress` / `AuthorizeSecurityGroupIngress`
-- `0.0.0.0/0` in CIDR ranges
+- `0.0.0.0/0` or `::/0` in CIDR ranges
 - `delete_network_acl_entry` removing DENY rules
-- `put_key_policy` adding wildcard principals
-- `attach_role_policy` re-attaching policies that were removed
+- `"Principal": "*"` or `"AWS": "*"` in any policy body the document constructs
+- `put_key_policy` calls combined with a wildcard principal in the policy body
+  (the API call alone is ambiguous - inspect the policy it pushes)
+- `attach_role_policy` calls referencing `AdministratorAccess`, `PowerUserAccess`,
+  or any policy that grants more than the role had before
 
 ---
 
 ## Detection Signal 5: Config Cost Spike
 
-Config evaluations cost $0.003 each. A remediation loop (Config evaluates → SSM fires → resource changes → Config evaluates again) will spike your Config bill before any security alert fires.
+A remediation loop (Config evaluates → SSM fires → resource changes → Config evaluates again) will spike your Config bill before any security alert fires.
 
 **Set a CloudWatch alarm:**
 
@@ -148,7 +170,7 @@ aws cloudwatch put-metric-alarm \
   --alarm-actions <your-sns-topic-arn>
 ```
 
-An unusual spike in Config evaluations — especially correlated with SSM Automation executions — is a strong signal.
+An unusual spike in Config evaluations, especially correlated with SSM Automation executions, is a strong signal.
 
 ---
 
@@ -201,14 +223,14 @@ If you find a rogue Config rule:
 
 5. **Audit and delete the IAM roles** used by the Lambda and SSM Automation.
 
-6. **Re-harden affected resources** — check S3 policies, security groups, NACLs, KMS key policies, and IAM role attachments for any changes made by the rogue remediation.
+6. **Re-harden affected resources**: check S3 policies, security groups, NACLs, KMS key policies, and IAM role attachments for any changes made by the rogue remediation.
 
 ---
 
 ## Prevention
 
-- **Alert on `PutConfigRule` and `PutRemediationConfigurations`** — every Config rule change should be reviewed
-- **Require IaC tags** on all Config rules — rules without `terraform:stack` or `aws:cloudformation:stack-name` tags are suspect
-- **Audit Config rules quarterly** — review Lambda code behind every custom rule
-- **Least-privilege SSM Automation roles** — SSM Automation roles should not have broad S3/EC2/KMS/IAM permissions
-- **Monitor Config costs** — set a CloudWatch alarm on Config evaluation volume
+- **Alert on `PutConfigRule` and `PutRemediationConfigurations`** - every Config rule change should be reviewed.
+- **Require IaC tags** on all Config rules - rules without `terraform:stack` or `aws:cloudformation:stack-name` tags are suspect.
+- **Audit Config rules quarterly** - review Lambda code behind every custom rule.
+- **Least-privilege SSM Automation roles** - SSM Automation roles should not have broad S3/EC2/KMS/IAM permissions.
+- **Monitor Config costs** - set a CloudWatch alarm on Config evaluation volume.

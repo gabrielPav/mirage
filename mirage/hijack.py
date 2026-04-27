@@ -31,7 +31,7 @@ import datetime as _dt
 import boto3
 from botocore.exceptions import ClientError
 
-from .constants import RULES
+from .constants import RULES, lambda_function_name_from_arn
 from .deploy import _zip_lambda
 from .remediation import DOCS
 
@@ -45,26 +45,6 @@ def _snapshot_path(account_id: str, region: str, rule_name: str) -> str:
     d = os.path.join(BACKUP_ROOT, f"{account_id}-{region}-{safe_rule}")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, f"{ts}.json")
-
-
-def _lambda_function_name_from_arn(arn: str) -> str:
-    """
-    Extract bare function name from a Lambda ARN.
-    Handles both unqualified and qualified (version/alias) ARNs:
-      arn:aws:lambda:us-east-1:123:function:myfn
-      arn:aws:lambda:us-east-1:123:function:myfn:3
-      arn:aws:lambda:us-east-1:123:function:myfn:prod
-    """
-    parts = arn.split(":")
-    if len(parts) < 7:
-        return parts[-1]
-    # parts[-2] is the function name when parts[-1] is a qualifier
-    tail = parts[-1]
-    if tail.isdigit() or tail in ("$LATEST",) or not tail.startswith(("arn:",)):
-        # If the 6th element is "function" and there are 8 parts, last is qualifier
-        if len(parts) == 8 and parts[5] == "function":
-            return parts[6]
-    return parts[-1]
 
 
 def _download_lambda_zip(lam, function_name: str) -> bytes:

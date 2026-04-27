@@ -22,6 +22,7 @@ from .heuristics import (
     check_recent_mutation,
 )
 from .scorer import score_rule
+from ..constants import lambda_function_name_from_arn
 
 
 def _get_all_config_rules(config_client) -> list:
@@ -173,9 +174,7 @@ def analyze(region: str, verbose: bool = False) -> list:
         source = rule.get("Source", {})
         if source.get("Owner") == "CUSTOM_LAMBDA":
             lambda_arn = source.get("SourceIdentifier", "")
-            parts = lambda_arn.split(":")
-            # Handle versioned ARNs: arn:aws:lambda:region:account:function:name:version
-            fn_name = parts[-1] if not parts[-1].isdigit() else parts[-2]
+            fn_name = lambda_function_name_from_arn(lambda_arn) if lambda_arn else ""
             if fn_name:
                 lambda_code = _get_lambda_code(lambda_client, fn_name)
 

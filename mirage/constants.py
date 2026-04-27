@@ -7,9 +7,6 @@ All rogue resource names are chosen to blend with legitimate compliance tooling.
 MIRAGE_TAG_KEY = "mirage:managed"
 MIRAGE_TAG_VALUE = "true"
 
-# Minimum interval between Config evaluations (cost + stealth control)
-MIN_EVALUATION_INTERVAL = "TwentyFour_Hours"  # AWS valid value
-
 # IAM role names created by Mirage
 LAMBDA_EXEC_ROLE_NAME = "aws-config-remediation-lambda-role"
 SSM_AUTOMATION_ROLE_NAME = "aws-config-automation-execution-role"
@@ -54,3 +51,17 @@ RULES = {
 }
 
 ALL_TARGETS = list(RULES.keys())
+
+
+def lambda_function_name_from_arn(arn: str) -> str:
+    """
+    Extract bare function name from a Lambda ARN.
+    Handles unqualified and qualified (version/alias) ARNs:
+      arn:aws:lambda:us-east-1:123:function:myfn
+      arn:aws:lambda:us-east-1:123:function:myfn:3
+      arn:aws:lambda:us-east-1:123:function:myfn:prod
+    """
+    parts = arn.split(":")
+    if len(parts) == 8 and parts[5] == "function":
+        return parts[6]  # qualifier in parts[7], name in parts[6]
+    return parts[-1]

@@ -6,8 +6,6 @@ Each target type gets:
   2. An SSM Automation document (the remediation that undoes hardening)
   3. A Config rule pointing at the Lambda
   4. A remediation configuration linking the rule to the SSM doc
-
-Cost control: MaximumExecutionFrequency is set to TwentyFour_Hours.
 """
 import io
 import os
@@ -17,7 +15,7 @@ import zipfile
 import boto3
 from botocore.exceptions import ClientError
 
-from .constants import RULES, MIRAGE_TAG_KEY, MIRAGE_TAG_VALUE, MIN_EVALUATION_INTERVAL
+from .constants import RULES, MIRAGE_TAG_KEY, MIRAGE_TAG_VALUE
 from .iam_roles import ensure_lambda_exec_role, ensure_ssm_automation_role
 from .remediation import DOCS
 
@@ -138,7 +136,6 @@ def _deploy_config_rule(target: str, lambda_arn: str, region: str):
                     },
                 ],
             },
-            "MaximumExecutionFrequency": MIN_EVALUATION_INTERVAL,
         },
         Tags=[{"Key": MIRAGE_TAG_KEY, "Value": MIRAGE_TAG_VALUE}],
     )

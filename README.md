@@ -15,17 +15,17 @@
 
 ## The Attack
 
-Every mature AWS organization runs this pattern:
+Mature AWS organizations run this pattern:
 
 ```
 Config rule detects non-compliant resource  →  SSM Automation fires  →  resource fixed
 ```
 
-It's a recommended Well-Architected pattern. Security teams trust it completely. Nobody audits whether a Config rule is enforcing the *right* thing.
+It's a recommended Well-Architected pattern. Security teams trust it. Nobody audits whether a Config rule is enforcing the *right* thing.
 
 **Mirage inverts this trust.**
 
-An attacker with 5 minutes of admin access either (v1) deploys a backwards Config rule or (v2) mutates the Lambda + SSM document of a rule that already exists. Either way, the rule flags *secure* configurations as non-compliant and the remediation *undoes* hardening. Then the attacker leaves. No credentials. No sessions. The compliance infrastructure does the rest.
+An attacker with 5 minutes of privileged access either (v1) deploys a backwards Config rule or (v2) mutates the Lambda + SSM document of a rule that already exists. Either way, the rule flags *secure* configurations as non-compliant and the remediation *undoes* hardening. Then the attacker leaves. No credentials. No sessions. The compliance infrastructure does the rest.
 
 ```
 Defender hardens S3 bucket
@@ -40,7 +40,7 @@ That last line is the real damage. **Misattribution.** The team spends hours deb
 
 ---
 
-## Why It's Different
+## Why it's Different
 
 The tools in this category creates a backdoor. Mirage turns the defender's own infrastructure into the backdoor. The compliance system is doing the attacker's work.
 
@@ -50,18 +50,16 @@ The tools in this category creates a backdoor. Mirage turns the defender's own i
 
 | IR Action | v1 Effect | v2 Effect |
 |---|---|---|
-| Rotate access keys | ✅ No effect — no user creds post-setup | ✅ No effect |
-| Revoke IAM sessions | ✅ No effect — Config/SSM run under service roles | ✅ No effect |
-| Delete attacker's IAM user | ✅ No effect — rules persist at service level | ✅ No effect |
-| Delete Lambda execution role | ❌ Breaks the loop | ✅ No effect — v2 uses the victim's own role |
-| Delete SSM Automation role | ❌ Breaks the loop | ✅ No effect — v2 uses the victim's own role |
+| Rotate access keys | ✅ No effect - no user creds post-setup | ✅ No effect |
+| Revoke IAM sessions | ✅ No effect - Config/SSM run under service roles | ✅ No effect |
+| Delete attacker's IAM user | ✅ No effect - rules persist at service level | ✅ No effect |
+| Delete Lambda execution role | ❌ Breaks the loop (after cached credentials expire - up to ~1 hour for in-flight executions) | ✅ No effect - v2 uses the victim's own role |
+| Delete SSM Automation role | ❌ Breaks the loop | ✅ No effect - v2 uses the victim's own role |
 | Delete the Config rule | ❌ Breaks the loop | ❌ Breaks the loop (but rule is one the org owns) |
-| Revert Lambda to prior version | — | ❌ Breaks the loop (`GetFunction` shows CodeSha256 drift) |
-| `UpdateDocument` back to prior content | — | ❌ Breaks the loop |
+| Revert Lambda to prior version | - | ❌ Breaks the loop (`GetFunction` shows CodeSha256 drift) |
+| `UpdateDocument` back to prior content | - | ❌ Breaks the loop |
 
 v2 is strictly more IR-resistant than v1 on IAM-role cleanup, at the cost of being more IR-detectable via code/content drift. An IR team that (a) has CloudTrail management events for Lambda/SSM, (b) stores Lambda version history or SHA256 baselines, or (c) runs `mirage detect` reliably evicts v2. Teams with none of these lose.
-
-> **Precise claim:** "Credential-less" means no *user* credentials. v1 depends on two IAM service roles Mirage creates; delete them and the loop breaks. v2 depends on no attacker-created resources at all — it piggy-backs on the org's existing roles, rule, and remediation config. Eviction in v2 means rolling back the Lambda code and SSM document content.
 
 ---
 
@@ -72,22 +70,22 @@ v2 is strictly more IR-resistant than v1 on IAM-role cleanup, at the cost of bei
 | `s3` | Flags bucket WITH a policy as non-compliant | Removes the bucket policy |
 | `sg` | Flags SG with no `0.0.0.0/0` rule as non-compliant | Opens all ports to `0.0.0.0/0` |
 | `nacl` | Flags NACL with DENY rules as non-compliant | Removes all DENY entries |
-| `kms` | Flags key with restricted policy as non-compliant | Appends a key-policy statement delegating to account-root with `kms:*` (one-shot, not sustained) |
-| `iam` | Flags role without target policy as non-compliant | Re-attaches the policy |
+| `kms` | Flags key with no wildcard principal as non-compliant | Appends a key-policy statement granting `Principal: "*"` with `kms:*`. Once the SID is present the Lambda returns COMPLIANT and SSM stops executing - but Config continues evaluating on every change event, so Config + SSM costs accrue until the rule is removed. |
+| `iam` | Flags role without target policy as non-compliant | Re-attaches `arn:aws:iam::aws:policy/AdministratorAccess` - a real persistence backdoor. Swap the constant in `mirage/rules/iam.py` and `IAM_DOC` in `mirage/remediation/__init__.py` to change the payload. |
 
-> ⚠️ **KMS warning:** Only run KMS targets in a dedicated sandbox account with purpose-built test keys. A KMS remediation loop on a key encrypting production data causes a real incident.
+> ⚠️ **KMS warning:** Only run KMS targets in a dedicated sandbox account with purpose-built test keys. The remediation pushes a wildcard principal with `kms:*`. On a key encrypting production data this is a real incident, not a hypothetical.
+>
+> ⚠️ **KMS prerequisite:** the test KMS key's *key policy* must allow the SSM Automation role to call `kms:PutKeyPolicy`. Default keys grant the account root `kms:*`, which is sufficient via IAM. Keys with custom policies that exclude root must be granted explicitly, or the remediation fails with `AccessDeniedException`.
 
 ---
 
 ## Detection Engine
 
-The detection side is the core research contribution — it's what separates Mirage from a 30-line boto3 script.
-
-`mirage detect` scans every Config rule in the account and scores it across seven heuristics:
+The detection side is the core research here. `mirage detect` scans every Config rule in the account and scores it across seven heuristics:
 
 | Heuristic | Score | Signal | Catches |
 |---|---|---|---|
-| **Undo delta** | 40 | Human hardens resource → SSM weakens same resource within 5 min | v1 + v2 |
+| **Undo delta** | 40 | Engineer hardens resource → SSM weakens same resource within 5 min | v1 + v2 |
 | **Inverted logic** | 30 | Lambda code flags *secure* configs as non-compliant | v1 + v2 |
 | **Unusual principal** | 25 | Rule created by a principal that doesn't normally manage Config | v1 only |
 | **Recent mutation** | 25 | Lambda `UpdateFunctionCode` or SSM `UpdateDocument` on a rule with auto-remediation | **v2** |
@@ -97,22 +95,27 @@ The detection side is the core research contribution — it's what separates Mir
 
 **Risk levels:** `CRITICAL` (≥70) · `HIGH` (≥40) · `MEDIUM` (≥20) · `LOW` (≥5) · `INFO`
 
-The **undo delta** is the single most powerful signal: a human hardens a resource and SSM weakens the same resource within 5 minutes. This pattern is nearly impossible to produce legitimately and generalizes to every resource type.
+The **undo delta** is the single most powerful signal: an engineer hardens a resource and SSM weakens the *same resource* within 5 minutes. The pair must share a resource ID (bucket name / SG ID / NACL ID / key ID / role name) - the heuristic correlates `requestParameters` from the hardening event with the `parameters.ResourceId` of the SSM execution. Time proximity alone is not enough.
 
 > Temporal heuristics require `cloudtrail:LookupEvents`. Without it, the detector falls back to static analysis (Lambda code inspection + SSM document inspection) and still catches inverted logic.
 
 ---
 
-## Known Limitations
+## The Gap IR Doesn't Cover
 
-- **Static-heuristic false positives and gaps.** `check_inverted_logic` and `check_remediation_weakens` are regex-based source inspections. (a) They will match against some legitimate AWS-managed and Security Hub rules whose evaluator code happens to colocate strings like `NON_COMPLIANT` and `encrypt`/`policy`. (b) `AttachRolePolicy` is in the weakening-keyword list, so any rule that re-attaches a baseline policy will trip `check_remediation_weakens`. (c) The IAM target's inversion (returns NON_COMPLIANT when a specific policy ARN is *absent*) is not matched by any current regex pattern — `inverted_logic` scores 0 on it; detection of the IAM target relies on `undo_delta` and `remediation_weakens` instead. The behavioural `undo_delta` is the keystone signal — it does not fire on legitimate rules because legitimate auto-remediation does not weaken security posture within 5 minutes of a human hardening action. Trust `undo_delta` first; treat `inverted_logic` and `remediation_weakens` as investigation triggers, not verdicts. Tightening these regexes (or replacing with AST analysis) is on the v1.1 roadmap.
-- **CloudTrail dependency.** `undo_delta`, `recent_mutation`, `unusual_principal`, and `creation_timing` require `cloudtrail:LookupEvents`. Without it, detection falls back to two heuristics (`inverted_logic`, `remediation_weakens`) — sufficient to catch v1 + v2 inversion, but maximum score drops from ~115 to ~50.
-- **KMS target is a one-shot, not a sustained loop.** The KMS Lambda flags keys without `Principal: "*"` as non-compliant; remediation appends an account-root delegation, which does not satisfy the wildcard check. Re-evaluation re-flags the key, but a `BaselineComplianceAccess` Sid de-dup prevents further policy mutations. The S3, SG, and NACL targets sustain the harden→flip loop. KMS is a single weakening event.
-- **v1 detection of provenance-based heuristics is org-specific.** `LEGITIMATE_CONFIG_PRINCIPALS` and `IAC_RULE_PREFIXES` in `detection/heuristics.py` are placeholder lists. Tune to your environment before relying on `unusual_principal` or `naming_anomaly`.
+The obvious objection: *"If the attacker has admin, they own the account anyway."*
+
+True at the moment of compromise. False the moment IR runs the standard playbook. Rotate keys, revoke sessions, delete the attacker's IAM user - admin access is revocable.
+
+Mirage's primitive does not depend on keeping that access. Once deployed, the harden→flip loop runs under the org's own service roles (v2) or attacker-created service roles that survive IAM-user deletion (v1). The attacker can be fully evicted at the IAM layer, and the loop keeps firing. Every time the defender re-hardens an affected resource, the compliance system undoes it and the defender blames Terraform drift, not an active attacker.
+
+The question Mirage answers is not *"how does the attacker get in?"* - that already has hundreds of answers. It is: **"Once IR has cleaned up the access, is the account actually clean?"**
+
+For any organization that doesn't audit Config rule logic, the honest answer is no. That check is not on any standard IR runbook. That's the gap.
 
 ---
 
-## Installation
+## Setup
 
 ```bash
 git clone https://github.com/gabrielPav/mirage
@@ -124,17 +127,17 @@ pip install -e .
 
 **Prerequisites:**
 - Python 3.10+
-- AWS credentials with admin access (**sandbox account only**)
+- AWS credentials with admin access (sandbox account only)
 - AWS Config recorder + delivery channel must exist in the target region
 - For full detection: `cloudtrail:LookupEvents` permission
 
 ---
 
-## Quickstart — Automated Test
+## Quickstart - Automated Test
 
 Two scripts at different cost/coverage tradeoffs. Pick based on what you need to know:
 
-### `mirage-test.sh` — smoke test (~3 minutes, < $0.01)
+### `mirage-test.sh` - smoke test (~3 minutes)
 
 Smoke-tests v1 against the S3 target only. Creates a test bucket, deploys the rogue rule, triggers the loop, asserts the static `inverted_logic` heuristic fires, cleans up. Good as a fast gate before the full verify run, or to confirm your AWS environment is set up correctly.
 
@@ -142,7 +145,7 @@ Smoke-tests v1 against the S3 target only. Creates a test bucket, deploys the ro
 bash mirage-test.sh
 ```
 
-It does **not** verify `undo_delta`, `recent_mutation`, v2 hijack, restore round-trip, or the false-positive baseline — those depend on CloudTrail propagation (5–15 min) and don't fit in a 3-minute smoke test. See below.
+It does **not** verify `undo_delta`, `recent_mutation`, v2 hijack, restore round-trip, or the false-positive baseline - those depend on CloudTrail propagation (5–15 min) and don't fit in a 3-minute smoke test. See below.
 
 **Expected output (excerpt):**
 ```
@@ -152,9 +155,9 @@ It does **not** verify `undo_delta`, `recent_mutation`, v2 hijack, restore round
 [PASS] LOOP CONFIRMED: Bucket policy was removed by SSM remediation after re-hardening
 ```
 
-### `mirage-verify.sh` — full verification (~15–20 minutes, < $0.05)
+### `mirage-verify.sh` - full verification (~15–20 minutes)
 
-Exercises every claim in this README. Use this before publishing or trusting results.
+Exercises the major v1 + v2 claims end-to-end against the S3 target (and the `sg` template via hijack). Run this before publishing or trusting results. The other targets (`nacl`, `kms`, `iam`) are **not** exercised by this script - they share the same primitives but you should sanity-test them yourself before relying on them in a demo.
 
 ```bash
 bash mirage-verify.sh
@@ -162,8 +165,8 @@ bash mirage-verify.sh
 
 | Phase | Verifies |
 |---|---|
-| 1 | False-positive baseline — count CRITICAL+HIGH findings against the clean account |
-| 3 | v1 deploy succeeds; capture original Lambda `CodeSha256` |
+| 1 | False-positive baseline - count CRITICAL+HIGH findings against the clean account |
+| 3 | v1 deploy succeeds, capture original Lambda `CodeSha256` |
 | 4 | Generates undo_delta evidence (re-harden → SSM weakening) |
 | 5 | v2 hijack mutates the Lambda; `CodeSha256` changes |
 | 6 | After CloudTrail propagation, `mirage detect` flags both `UNDO DELTA` and `Recent mutation of rule internals` |
@@ -177,27 +180,27 @@ If any phase fails, the script exits non-zero and prints what was missing.
 ## Usage
 
 ```bash
-# v1 — Deploy new rogue rules (loud: PutConfigRule + CreateFunction + CreateDocument)
+# v1 - Deploy new rogue rules (loud: PutConfigRule + CreateFunction + CreateDocument)
 mirage deploy --targets s3,sg,nacl     # specific targets
 mirage deploy --all                    # all five targets
 mirage deploy --all --verbose          # step-by-step output
 
-# v2 — Parasitize an existing customer-owned rule
+# v2 - Parasitize an existing customer-owned rule
 #      (stealthier: UpdateFunctionCode + UpdateDocument + UpdateDocumentDefaultVersion)
 mirage hijack --rule my-s3-compliance --target s3 --verbose
 mirage hijack --rule my-sg-baseline  --target sg  --skip-lambda   # SSM-only one-shot
 mirage restore --rule my-s3-compliance                            # reverse from snapshot
 mirage restore --snapshot ~/.mirage/backups/123-us-east-1-my-s3-compliance/<ts>.json
 
-# Check what's running (v1 only — v2 uses rules you don't own, nothing to list)
+# Check what's running (v1 only - v2 uses rules you don't own, nothing to list)
 mirage status
 
-# Detect — scan the account for suspicious Config rules (catches v1 AND v2)
+# Detect - scan the account for suspicious Config rules (catches v1 AND v2)
 mirage detect                          # summary
 mirage detect --verbose                # full evidence per rule
 mirage detect --json                   # machine-readable
 
-# Cleanup (v1 only — use `mirage restore` for v2)
+# Cleanup (v1 only - use `mirage restore` for v2)
 mirage cleanup --dry-run               # preview
 mirage cleanup                         # remove everything
 mirage cleanup --targets s3,sg         # remove specific targets
@@ -237,24 +240,20 @@ mirage cleanup --region us-east-1
 
 v1 and v2 are two different deployment modes for the same attack primitive. Both ship.
 
-**v1 — `mirage deploy`.** Creates new Config rule + Lambda + SSM doc + remediation + IAM roles. Emits `PutConfigRule`, `CreateFunction`, `CreateDocument`, `PutRemediationConfigurations`, `CreateRole`, `AttachRolePolicy`. Loud — any SOC rule on Config rule creation catches it.
+**v1 - `mirage deploy`.** Creates new Config rule + Lambda + SSM doc + remediation + IAM roles. Emits `PutConfigRule`, `CreateFunction`, `CreateDocument`, `PutRemediationConfigurations`, `CreateRole`, `AttachRolePolicy`, `PutRolePolicy`. Loud: any SOC rule on Config rule creation catches it. The Lambda execution role attaches read-only policies per service (`AmazonS3ReadOnlyAccess`, `AmazonEC2ReadOnlyAccess`, `AWSKeyManagementServicePowerUser`, `IAMReadOnlyAccess`) - Lambda evaluators only read resource state, they do not mutate it. The SSM Automation role carries the write permissions (`AmazonS3FullAccess`, `AmazonEC2FullAccess`, etc.) needed to execute remediations. Both roles are still over-broad for a single target; tighten them per-target if you want a quieter footprint.
 
-**v2 — `mirage hijack`.** Parasitizes an existing customer-owned Config rule by running `UpdateFunctionCode` on its Lambda and `UpdateDocument` + `UpdateDocumentDefaultVersion` on its remediation SSM doc. The rule name, creator, creation time, IAM roles, and remediation config are all pristine. Stealthier than v1 but **not invisible**:
+**v2 - `mirage hijack`.** Hijacks an existing customer-owned Config rule by running `UpdateFunctionCode` on its Lambda and `UpdateDocument` + `UpdateDocumentDefaultVersion` on its remediation SSM doc. The rule name, creator, creation time, IAM roles, and remediation config are all pristine. Stealthier than v1 but not invisible:
 
 | What still catches v2 | Why |
 |---|---|
-| Splunk ESCU analytic | `AWS Lambda UpdateFunctionCode` [research.splunk.com](https://research.splunk.com/) |
+| Splunk ESCU analytics | `AWS Lambda UpdateFunctionCode` |
 | `CodeSha256` drift | Lambda exposes the code hash via `GetFunction` |
+| Lambda `LastModified` drift | `GetFunctionConfiguration` exposes a fresh timestamp on every `UpdateFunctionCode` - visible without storing a baseline |
+| SSM doc version drift | `DescribeDocument` shows incremented `LatestVersion` and a new `DefaultVersion` after `UpdateDocumentDefaultVersion` |
 | IaC drift detection | Terraform/CloudFormation managing the target Lambda/doc flags mutation on next plan |
-| `mirage detect` undo-delta heuristic | Behavioural: human hardens → SSM weakens. Fires regardless of how the rule got there |
-| `mirage detect` inverted-logic heuristic | Static Lambda code inspection — the inversion is still visible |
-| `mirage detect` remediation-weakens heuristic | Reads SSM doc body — `delete_bucket_policy`, `0.0.0.0/0`, etc. still detectable |
-
-Maximum signal reduction against Mirage's own scorer: about 40 points (drops `unusual_principal` + `naming_anomaly` + `creation_timing` — all provenance-based). With `cloudtrail:LookupEvents` available, the remaining behavioural + static heuristics push a successful hijack into `CRITICAL` (≈115). In static-only mode (no CloudTrail), it lands at `HIGH` (≈50) — still investigable, but no longer the strongest verdict. That is the point: the detection engine is intentionally weighted toward provenance-agnostic signals.
-
-### Correction of an earlier claim
-
-An earlier version of this doc suggested that "UpdateDocument alone" (pure SSM-doc parasite, no Lambda mutation) would give the same weaponised loop as v1. **It does not.** Without inverting the Lambda evaluator, the existing rule still flags *genuinely* non-compliant resources — the attacker poisons the fix, but does not create a harden→flip loop against secure resources. The SSM-only mode is exposed as `--skip-lambda` for research completeness; it is a one-shot weakening trap, not persistence.
+| `mirage detect` undo-delta heuristic | Behavioural: human hardens → SSM weakens *the same resource*. Fires regardless of how the rule got there |
+| `mirage detect` inverted-logic heuristic | Static Lambda code inspection - the inversion is still visible |
+| `mirage detect` remediation-weakens heuristic | Reads SSM doc body - `delete_bucket_policy`, `0.0.0.0/0`, wildcard-principal patterns still detectable |
 
 ### Preflight rejections in `hijack`
 
@@ -268,7 +267,7 @@ The command fails fast if the target is unsuitable:
 
 ### Reversibility
 
-`mirage hijack` snapshots the original Lambda zip (base64) and SSM document content (YAML or JSON) to `~/.mirage/backups/<account>-<region>-<rule>/<timestamp>.json` before any mutation. `mirage restore --rule <name>` (or `--snapshot <path>`) pushes the originals back via the same API calls. The restore itself is visible in CloudTrail — no attempt is made to hide it.
+`mirage hijack` snapshots the original Lambda zip (base64) and SSM document content (YAML or JSON) to `~/.mirage/backups/<account>-<region>-<rule>/<timestamp>.json` before any mutation. `mirage restore --rule <name>` (or `--snapshot <path>`) pushes the originals back via the same API calls. The restore itself is visible in CloudTrail - no attempt is made to hide it.
 
 ---
 
@@ -280,14 +279,18 @@ The command fails fast if the target is unsuitable:
   "Effect": "Allow",
   "Action": [
     "config:PutConfigRule", "config:PutRemediationConfigurations",
+    "config:TagResource",
     "lambda:CreateFunction", "lambda:UpdateFunctionCode",
-    "lambda:AddPermission", "lambda:GetFunction",
+    "lambda:AddPermission", "lambda:GetFunction", "lambda:TagResource",
     "ssm:CreateDocument", "ssm:UpdateDocument", "ssm:GetDocument",
-    "iam:CreateRole", "iam:AttachRolePolicy", "iam:GetRole", "iam:PassRole"
+    "ssm:AddTagsToResource",
+    "iam:CreateRole", "iam:AttachRolePolicy", "iam:PutRolePolicy",
+    "iam:GetRole", "iam:PassRole", "iam:TagRole"
   ],
   "Resource": "*"
 }
 ```
+> `iam:PutRolePolicy` is required because the SSM Automation role gets an inline policy granting `kms:PutKeyPolicy` (the AWS-managed `AWSKeyManagementServicePowerUser` does not include it, so the KMS remediation would otherwise fail with `AccessDeniedException`).
 
 **Hijack (v2):**
 ```json
@@ -316,32 +319,7 @@ The command fails fast if the target is unsuitable:
 }
 ```
 
-> The `recent_mutation` heuristic relies on CloudTrail records for
-> `UpdateFunctionCode`, `UpdateDocument`, and `UpdateDocumentDefaultVersion`.
-> These are management events logged by default — no extra permission beyond
-> `cloudtrail:LookupEvents` is required.
-
----
-
-## Cost
-
-Config evaluations cost $0.003 each. Mirage sets `MaximumExecutionFrequency: TwentyFour_Hours` by default. The automated test costs under $0.01. Do not lower the evaluation frequency during testing — a tight loop will spike your bill before any security alert fires.
-
-> Abnormal Config cost spikes are themselves a detection signal. See [detection-guide.md](docs/detection-guide.md).
-
----
-
-## The Research Question
-
-The obvious critique: *"If the attacker has admin, they own the account anyway."*
-
-True at the moment of compromise. False the moment IR runs the standard playbook. Rotate keys, revoke sessions, delete the attacker's IAM user — admin access is fungible. It gets taken away.
-
-Mirage's primitive does not depend on keeping that access. Once deployed, the harden→flip loop runs under the org's own service roles (v2) or attacker-created service roles that survive IAM-user deletion (v1). The attacker can be fully evicted at the IAM layer, and the loop keeps firing. Every time the defender re-hardens an affected resource, the compliance system undoes it — and the defender blames Terraform drift, not an active attacker.
-
-The question Mirage answers is not *"how does the attacker get in?"* — that already has hundreds of answers. It is: **"Once IR has cleaned up the access, is the account actually clean?"**
-
-For any organization that does not audit Config rule *logic* against the resources those rules protect, the honest answer is no. Auditing Config rule logic is not on any standard IR runbook. That gap is the research contribution.
+> The `recent_mutation` heuristic relies on CloudTrail records for `UpdateFunctionCode`, `UpdateDocument`, and `UpdateDocumentDefaultVersion`. These are management events logged by default, no extra permission beyond `cloudtrail:LookupEvents` is required.
 
 ---
 

@@ -6,38 +6,53 @@ Score 0 = no signal. Higher = more suspicious.
 Max total score per rule is ~155 (sum of all seven heuristic weights).
 """
 import json
+import os
 import re
 import boto3
 from datetime import datetime, timezone, timedelta
 from botocore.exceptions import ClientError
+from ..constants import lambda_function_name_from_arn
 
-# Keywords that suggest a remediation is WEAKENING security posture
+# Keywords / patterns that suggest a remediation is WEAKENING security posture.
+# PutKeyPolicy and AttachRolePolicy are deliberately excluded — both are also
+# common hardening operations and trip too many false positives. Wildcard-
+# principal patterns below catch the actually-permissive variants.
 WEAKENING_KEYWORDS = [
     "delete_bucket_policy", "DeleteBucketPolicy",
     "authorize_security_group_ingress", "AuthorizeSecurityGroupIngress",
     "0.0.0.0/0", "::/0",
     "delete_network_acl_entry", "DeleteNetworkAclEntry",
-    "put_key_policy", "PutKeyPolicy",
-    "attach_role_policy", "AttachRolePolicy",
     "AllowAll", "allow_all",
-    "Action.*\\*",
-    "Effect.*Allow.*\\*",
+    r'Principal["\']\s*:\s*["\']\*["\']',
+    r'["\']AWS["\']\s*:\s*["\']\*["\']',
 ]
 
-# IAM principals that legitimately manage Config rules (org-specific — adjust per environment)
-LEGITIMATE_CONFIG_PRINCIPALS = [
+# IAM principals that legitimately manage Config rules.
+# Override via MIRAGE_LEGITIMATE_PRINCIPALS env var (comma-separated).
+_default_principals = [
     "AWSControlTower",
     "config-service",
     "cloudformation",
     "terraform",
     "SecurityHub",
 ]
+LEGITIMATE_CONFIG_PRINCIPALS: list[str] = [
+    p.strip() for p in
+    os.environ.get("MIRAGE_LEGITIMATE_PRINCIPALS", ",".join(_default_principals)).split(",")
+    if p.strip()
+]
 
-# Known IaC-deployed rule name prefixes (org-specific — adjust per environment)
-IAC_RULE_PREFIXES = [
+# Known IaC-deployed rule name prefixes.
+# Override via MIRAGE_IAC_PREFIXES env var (comma-separated).
+_default_prefixes = [
     "aws-",
     "securityhub-",
     "ct-",
+]
+IAC_RULE_PREFIXES: list[str] = [
+    p.strip() for p in
+    os.environ.get("MIRAGE_IAC_PREFIXES", ",".join(_default_prefixes)).split(",")
+    if p.strip()
 ]
 
 
@@ -58,41 +73,83 @@ def check_unusual_principal(rule: dict, cloudtrail_events: list) -> tuple:
     return (0, "")
 
 
+def _extract_resource_ids(event: dict) -> set:
+    """Pull resource identifiers from a CloudTrail event."""
+    ids = set()
+    for r in event.get("Resources", []) or []:
+        name = r.get("ResourceName", "")
+        if name:
+            ids.add(name)
+    raw = event.get("CloudTrailEvent", "")
+    if raw:
+        try:
+            evt = json.loads(raw)
+            req = evt.get("requestParameters", {}) or {}
+            for k in ("bucketName", "groupId", "networkAclId", "keyId", "roleName"):
+                v = req.get(k)
+                if isinstance(v, str) and v:
+                    ids.add(v)
+            params = req.get("parameters") or req.get("automationParameters") or {}
+            if isinstance(params, dict):
+                rid = params.get("ResourceId")
+                if isinstance(rid, list):
+                    for x in rid:
+                        if isinstance(x, str) and x:
+                            ids.add(x)
+                elif isinstance(rid, str) and rid:
+                    ids.add(rid)
+        except Exception:
+            pass
+    return ids
+
+
+def _is_human_actor(event: dict) -> bool:
+    """True if the event was initiated by a human/IAM principal, not an AWS service."""
+    raw = event.get("CloudTrailEvent", "")
+    if not raw:
+        return True
+    try:
+        evt = json.loads(raw)
+        ui = evt.get("userIdentity", {}) or {}
+        if ui.get("type") == "AWSService":
+            return False
+        invoked_by = ui.get("invokedBy", "") or ""
+        if invoked_by.endswith(".amazonaws.com"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
     """
     Heuristic: The 'undo delta' — the strongest signal.
-    Detects: human hardens resource → SSM weakens same resource within 5 minutes.
+    Detects: human hardens resource → SSM weakens the SAME resource within 5 minutes.
 
-    Only fires if the rule has auto-remediation attached (avoids account-wide false positives).
+    Only fires if (a) the rule has auto-remediation attached and (b) we can
+    correlate a hardening and a weakening event on the same resource ID.
     Requires CloudTrail LookupEvents access. Returns 0 if no events.
     """
-    # Only meaningful for rules that actually have auto-remediation
     if not rule.get("_has_remediation"):
         return (0, "")
-    WINDOW_SECONDS = 300  # 5 minutes
+    WINDOW_SECONDS = 300
 
-    # Collect SSM automation executions that weakened resources
-    ssm_weakening = []
-    for event in cloudtrail_events:
-        if event.get("EventSource") == "ssm.amazonaws.com" and \
-                event.get("EventName") in ("StartAutomationExecution",):
-            ssm_weakening.append(event)
+    ssm_weakening = [
+        e for e in cloudtrail_events
+        if e.get("EventSource") == "ssm.amazonaws.com"
+        and e.get("EventName") == "StartAutomationExecution"
+    ]
 
-    # Collect human hardening events
     hardening_actions = {
         "PutBucketPolicy", "PutBucketPublicAccessBlock",
-        "AuthorizeSecurityGroupEgress",  # removing ingress = revoking
         "RevokeSecurityGroupIngress",
         "CreateNetworkAclEntry",
         "PutKeyPolicy",
         "DetachRolePolicy", "DeleteRolePolicy",
     }
-
     human_hardening = [
         e for e in cloudtrail_events
-        if e.get("EventName") in hardening_actions
-        and "ssm" not in e.get("Username", "").lower()
-        and "config" not in e.get("Username", "").lower()
+        if e.get("EventName") in hardening_actions and _is_human_actor(e)
     ]
 
     for h_event in human_hardening:
@@ -101,8 +158,14 @@ def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
             continue
         if isinstance(h_time, str):
             h_time = datetime.fromisoformat(h_time.replace("Z", "+00:00"))
+        h_ids = _extract_resource_ids(h_event)
+        if not h_ids:
+            continue
 
         for s_event in ssm_weakening:
+            s_ids = _extract_resource_ids(s_event)
+            if not (h_ids & s_ids):
+                continue
             s_time = s_event.get("EventTime")
             if not s_time:
                 continue
@@ -111,10 +174,11 @@ def check_undo_delta(rule: dict, cloudtrail_events: list) -> tuple:
 
             delta = abs((s_time - h_time).total_seconds())
             if delta <= WINDOW_SECONDS:
+                shared = ", ".join(sorted(h_ids & s_ids))
                 return (
                     40,
                     f"UNDO DELTA: Human hardening '{h_event['EventName']}' at {h_time} "
-                    f"followed by SSM weakening '{s_event['EventName']}' at {s_time} "
+                    f"followed by SSM weakening on resource [{shared}] at {s_time} "
                     f"({int(delta)}s apart)",
                 )
 
@@ -134,10 +198,13 @@ def check_inverted_logic(rule: dict, lambda_code: str) -> tuple:
         (r"NON_COMPLIANT.*encrypt", "flags encryption as non-compliant"),
         (r"NON_COMPLIANT.*policy", "flags policy presence as non-compliant"),
         (r"NON_COMPLIANT.*restrict", "flags restrictions as non-compliant"),
+        (r"NON_COMPLIANT.*wildcard", "flags absence of wildcard as non-compliant"),
         (r"get_bucket_policy.*NON_COMPLIANT", "flags bucket policy existence as non-compliant"),
+        (r"get_key_policy.*NON_COMPLIANT", "flags key policy existence as non-compliant"),
         (r"0\.0\.0\.0/0.*COMPLIANT", "treats open CIDR as compliant"),
         (r"deny.*NON_COMPLIANT", "flags DENY rules as non-compliant"),
         (r"AllowAll.*COMPLIANT", "treats AllowAll as compliant"),
+        (r'principal.*[\'\"]\*[\'\"].*COMPLIANT', "treats wildcard principal as compliant"),
     ]
 
     for pattern, description in inverted_patterns:
@@ -235,12 +302,7 @@ def check_recent_mutation(rule: dict, cloudtrail_events: list) -> tuple:
         return (0, "")
 
     lambda_arn = source.get("SourceIdentifier", "")
-    parts = lambda_arn.split(":")
-    # Handle qualified ARNs (function:name:version|alias)
-    if len(parts) == 8 and parts[5] == "function":
-        fn_name = parts[6]
-    else:
-        fn_name = parts[-1]
+    fn_name = lambda_function_name_from_arn(lambda_arn) if lambda_arn else ""
 
     rem_target = rule.get("_remediation_target", "") or ""
 

