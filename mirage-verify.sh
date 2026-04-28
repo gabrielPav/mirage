@@ -192,14 +192,9 @@ ok "v1 deployed, original SHA captured"
 # =============================================================================
 # PHASE 4: Generate undo_delta evidence — re-harden, let SSM weaken
 # =============================================================================
-log "PHASE 4: Triggering Config evaluation..."
-aws configservice start-config-rules-evaluation \
-  --config-rule-names "$RULE_NAME" \
-  --region "$REGION"
-log "Waiting 30s for first remediation..."
+log "PHASE 4: Re-applying bucket policy (the 'human hardening' event)..."
+log "Waiting 30s for Config to register the deployed rule..."
 sleep 30
-
-log "Re-applying bucket policy (the 'human hardening' event)..."
 aws s3api put-bucket-policy \
   --bucket "$TEST_BUCKET" \
   --region "$REGION" \

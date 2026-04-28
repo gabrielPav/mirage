@@ -160,56 +160,54 @@ def hijack(
     log(f"Lambda ARN:       {lambda_arn}")
     log(f"SSM document:     {ssm_doc_name}")
 
-    # 1. Check if a snapshot already exists (don't overwrite clean backups)
+    # 1. Always snapshot the current state before mutating (each hijack gets its own
+    #    timestamped snapshot so restore always round-trips to *this* deploy).
     existing = _existing_snapshots(account_id, region, rule_name)
     if existing:
-        latest = existing[-1]
-        print(f"[mirage hijack] Snapshot already exists (not overwriting): {latest}")
-        print(f"[mirage hijack] To restore later: mirage restore --rule {rule_name}")
-        snap_path = latest
-    else:
-        # 1b. Snapshot originals (reversibility)
-        log("Snapshotting original Lambda zip + SSM doc content...")
-        original_zip = _download_lambda_zip(lam, fn_name)
-        original_doc_content = ""
-        original_doc_format = "YAML"
-        original_doc_version = ""
-        if ssm_doc_name:
-            try:
-                doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="YAML")
-                original_doc_content = doc_resp.get("Content", "")
-                original_doc_format = doc_resp.get("DocumentFormat", "YAML")
-                original_doc_version = doc_resp.get("DocumentVersion", "")
-            except ClientError as e:
-                # Try JSON format as a fallback for docs originally authored in JSON
-                if e.response["Error"]["Code"] in ("InvalidDocument", "InvalidDocumentContent"):
-                    doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="JSON")
-                    original_doc_content = doc_resp.get("Content", "")
-                    original_doc_format = doc_resp.get("DocumentFormat", "JSON")
-                    original_doc_version = doc_resp.get("DocumentVersion", "")
-                else:
-                    raise
+        print(f"[mirage hijack] Prior snapshot(s) exist — creating a new one for this run.")
 
-        snapshot = {
-            "account_id": account_id,
-            "region": region,
-            "rule_name": rule_name,
-            "target_template": target,
-            "lambda_function_name": fn_name,
-            "lambda_arn": lambda_arn,
-            "ssm_doc_name": ssm_doc_name,
-            "taken_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
-            "original_lambda_zip_b64": base64.b64encode(original_zip).decode("ascii"),
-            "original_ssm_doc_content": original_doc_content,
-            "original_ssm_doc_format": original_doc_format,
-            "original_ssm_doc_version": original_doc_version,
-            "skip_lambda": skip_lambda,
-            "skip_ssm": skip_ssm,
-        }
-        snap_path = _snapshot_path(account_id, region, rule_name)
-        with open(snap_path, "w") as f:
-            json.dump(snapshot, f, indent=2)
-        print(f"[mirage hijack] Snapshot: {snap_path}")
+    # Snapshot originals (reversibility)
+    log("Snapshotting original Lambda zip + SSM doc content...")
+    original_zip = _download_lambda_zip(lam, fn_name)
+    original_doc_content = ""
+    original_doc_format = "YAML"
+    original_doc_version = ""
+    if ssm_doc_name:
+        try:
+            doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="YAML")
+            original_doc_content = doc_resp.get("Content", "")
+            original_doc_format = doc_resp.get("DocumentFormat", "YAML")
+            original_doc_version = doc_resp.get("DocumentVersion", "")
+        except ClientError as e:
+            # Try JSON format as a fallback for docs originally authored in JSON
+            if e.response["Error"]["Code"] in ("InvalidDocument", "InvalidDocumentContent"):
+                doc_resp = ssm.get_document(Name=ssm_doc_name, DocumentFormat="JSON")
+                original_doc_content = doc_resp.get("Content", "")
+                original_doc_format = doc_resp.get("DocumentFormat", "JSON")
+                original_doc_version = doc_resp.get("DocumentVersion", "")
+            else:
+                raise
+
+    snapshot = {
+        "account_id": account_id,
+        "region": region,
+        "rule_name": rule_name,
+        "target_template": target,
+        "lambda_function_name": fn_name,
+        "lambda_arn": lambda_arn,
+        "ssm_doc_name": ssm_doc_name,
+        "taken_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
+        "original_lambda_zip_b64": base64.b64encode(original_zip).decode("ascii"),
+        "original_ssm_doc_content": original_doc_content,
+        "original_ssm_doc_format": original_doc_format,
+        "original_ssm_doc_version": original_doc_version,
+        "skip_lambda": skip_lambda,
+        "skip_ssm": skip_ssm,
+    }
+    snap_path = _snapshot_path(account_id, region, rule_name)
+    with open(snap_path, "w") as f:
+        json.dump(snapshot, f, indent=2)
+    print(f"[mirage hijack] Snapshot: {snap_path}")
 
     emitted = []
 
